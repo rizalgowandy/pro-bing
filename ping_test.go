@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"runtime"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,10 @@ import (
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 )
+
+var testAddr net.Addr = &net.IPAddr{
+	IP: net.IPv4(127, 0, 0, 1),
+}
 
 func TestProcessPacket(t *testing.T) {
 	pinger := makeTestPinger()
@@ -49,11 +54,7 @@ func TestProcessPacket(t *testing.T) {
 
 	msgBytes, _ := msg.Marshal(nil)
 
-	pkt := packet{
-		nbytes: len(msgBytes),
-		bytes:  msgBytes,
-		ttl:    24,
-	}
+	pkt := makeTestPacket(msgBytes)
 
 	err = pinger.processPacket(&pkt)
 	AssertNoError(t, err)
@@ -91,11 +92,7 @@ func TestProcessPacket_IgnoreNonEchoReplies(t *testing.T) {
 
 	msgBytes, _ := msg.Marshal(nil)
 
-	pkt := packet{
-		nbytes: len(msgBytes),
-		bytes:  msgBytes,
-		ttl:    24,
-	}
+	pkt := makeTestPacket(msgBytes)
 
 	err = pinger.processPacket(&pkt)
 	AssertNoError(t, err)
@@ -134,11 +131,7 @@ func TestProcessPacket_IDMismatch(t *testing.T) {
 
 	msgBytes, _ := msg.Marshal(nil)
 
-	pkt := packet{
-		nbytes: len(msgBytes),
-		bytes:  msgBytes,
-		ttl:    24,
-	}
+	pkt := makeTestPacket(msgBytes)
 
 	err = pinger.processPacket(&pkt)
 	AssertNoError(t, err)
@@ -176,11 +169,7 @@ func TestProcessPacket_TrackerMismatch(t *testing.T) {
 
 	msgBytes, _ := msg.Marshal(nil)
 
-	pkt := packet{
-		nbytes: len(msgBytes),
-		bytes:  msgBytes,
-		ttl:    24,
-	}
+	pkt := makeTestPacket(msgBytes)
 
 	err = pinger.processPacket(&pkt)
 	AssertNoError(t, err)
@@ -214,11 +203,7 @@ func TestProcessPacket_LargePacket(t *testing.T) {
 
 	msgBytes, _ := msg.Marshal(nil)
 
-	pkt := packet{
-		nbytes: len(msgBytes),
-		bytes:  msgBytes,
-		ttl:    24,
-	}
+	pkt := makeTestPacket(msgBytes)
 
 	err = pinger.processPacket(&pkt)
 	AssertNoError(t, err)
@@ -242,11 +227,7 @@ func TestProcessPacket_PacketTooSmall(t *testing.T) {
 
 	msgBytes, _ := msg.Marshal(nil)
 
-	pkt := packet{
-		nbytes: len(msgBytes),
-		bytes:  msgBytes,
-		ttl:    24,
-	}
+	pkt := makeTestPacket(msgBytes)
 
 	err := pinger.processPacket(&pkt)
 	AssertError(t, err, "")
@@ -261,6 +242,7 @@ func TestNewPingerValid(t *testing.T) {
 	AssertNotEqualStrings(t, "www.google.com", p.IPAddr().String())
 	AssertTrue(t, isIPv4(p.IPAddr().IP))
 	AssertFalse(t, p.Privileged())
+	AssertEquals(t, 192, p.tclass)
 	// Test that SetPrivileged works
 	p.SetPrivileged(true)
 	AssertTrue(t, p.Privileged())
@@ -272,6 +254,9 @@ func TestNewPingerValid(t *testing.T) {
 	err = p.SetAddr("ipv6.google.com")
 	AssertNoError(t, err)
 	AssertFalse(t, isIPv4(p.IPAddr().IP))
+	// Test setting traffic class
+	p.SetTrafficClass(0)
+	AssertEquals(t, 0, p.tclass)
 
 	p = New("localhost")
 	err = p.Resolve()
@@ -477,6 +462,42 @@ func TestStatisticsLossy(t *testing.T) {
 	}
 }
 
+func TestStatisticsZeroDivision(t *testing.T) {
+	p := New("localhost")
+	err := p.Resolve()
+	AssertNoError(t, err)
+	AssertEqualStrings(t, "localhost", p.Addr())
+
+	p.PacketsSent = 0
+	stats := p.Statistics()
+
+	// If packets were not sent (due to send errors), ensure that
+	// PacketLoss is 0 instead of NaN due to zero division
+	if stats.PacketLoss != 0 {
+		t.Errorf("Expected %v, got %v", 0, stats.PacketLoss)
+	}
+}
+
+func TestSetInterfaceName(t *testing.T) {
+	pinger := New("localhost")
+	pinger.Count = 1
+	pinger.Timeout = time.Second
+
+	// Set loopback interface
+	pinger.InterfaceName = "lo"
+	err := pinger.Run()
+	if runtime.GOOS == "linux" {
+		AssertNoError(t, err)
+	} else {
+		AssertError(t, err, "other platforms unsupport this feature")
+	}
+
+	// Set fake interface
+	pinger.InterfaceName = "L()0pB@cK"
+	err = pinger.Run()
+	AssertError(t, err, "device not found")
+}
+
 // Test helpers
 func makeTestPinger() *Pinger {
 	pinger := New("127.0.0.1")
@@ -488,6 +509,16 @@ func makeTestPinger() *Pinger {
 	pinger.Size = 0
 
 	return pinger
+}
+
+// makeTestPacket emulates a packet with the message msg which come from testAddr
+func makeTestPacket(msg []byte) packet {
+	return packet{
+		bytes:  msg,
+		nbytes: len(msg),
+		ttl:    24,
+		addr:   testAddr,
+	}
 }
 
 func AssertNoError(t *testing.T, err error) {
@@ -510,6 +541,14 @@ func AssertEqualStrings(t *testing.T, expected, actual string) {
 	t.Helper()
 	if expected != actual {
 		t.Errorf("Expected %s, got %s, Stack:\n%s",
+			expected, actual, string(debug.Stack()))
+	}
+}
+
+func AssertEquals[T comparable](t *testing.T, expected, actual T) {
+	t.Helper()
+	if expected != actual {
+		t.Errorf("Expected %v, got %v, Stack:\n%s",
 			expected, actual, string(debug.Stack()))
 	}
 }
@@ -567,11 +606,7 @@ func BenchmarkProcessPacket(b *testing.B) {
 
 	msgBytes, _ := msg.Marshal(nil)
 
-	pkt := packet{
-		nbytes: len(msgBytes),
-		bytes:  msgBytes,
-		ttl:    24,
-	}
+	pkt := makeTestPacket(msgBytes)
 
 	for k := 0; k < b.N; k++ {
 		pinger.processPacket(&pkt)
@@ -619,11 +654,7 @@ func TestProcessPacket_IgnoresDuplicateSequence(t *testing.T) {
 
 	msgBytes, _ := msg.Marshal(nil)
 
-	pkt := packet{
-		nbytes: len(msgBytes),
-		bytes:  msgBytes,
-		ttl:    24,
-	}
+	pkt := makeTestPacket(msgBytes)
 
 	err = pinger.processPacket(&pkt)
 	AssertNoError(t, err)
@@ -644,9 +675,14 @@ func (c testPacketConn) SetFlagTTL() error                 { return nil }
 func (c testPacketConn) SetReadDeadline(t time.Time) error { return nil }
 func (c testPacketConn) SetTTL(t int)                      {}
 func (c testPacketConn) SetMark(m uint) error              { return nil }
+func (c testPacketConn) SetDoNotFragment() error           { return nil }
+func (c testPacketConn) SetBroadcastFlag() error           { return nil }
+func (c testPacketConn) InstallICMPIDFilter(id int) error  { return nil }
+func (c testPacketConn) SetIfIndex(ifIndex int)            {}
+func (c testPacketConn) SetTrafficClass(uint8) error       { return nil }
 
 func (c testPacketConn) ReadFrom(b []byte) (n int, ttl int, src net.Addr, err error) {
-	return 0, 0, nil, nil
+	return 0, 0, testAddr, nil
 }
 
 func (c testPacketConn) WriteTo(b []byte, dst net.Addr) (int, error) {
@@ -687,7 +723,7 @@ type testPacketConnBadRead struct {
 }
 
 func (c testPacketConnBadRead) ReadFrom(b []byte) (n int, ttl int, src net.Addr, err error) {
-	return 0, 0, nil, errors.New("bad read")
+	return 0, 0, testAddr, errors.New("bad read")
 }
 
 func TestRunBadRead(t *testing.T) {
@@ -733,7 +769,7 @@ func (c *testPacketConnOK) ReadFrom(b []byte) (n int, ttl int, src net.Addr, err
 	c.m.Lock()
 	defer c.m.Unlock()
 	if atomic.LoadInt32(&c.writeDone) == 0 {
-		return 0, 0, nil, nil
+		return 0, 0, testAddr, nil
 	}
 	msg, err := icmp.ParseMessage(ipv4.ICMPTypeEcho.Protocol(), c.buf)
 	if err != nil {
@@ -745,7 +781,7 @@ func (c *testPacketConnOK) ReadFrom(b []byte) (n int, ttl int, src net.Addr, err
 		return 0, 0, nil, err
 	}
 	time.Sleep(10 * time.Millisecond)
-	return copy(b, buf), 64, c.dst, nil
+	return copy(b, buf), 64, testAddr, nil
 }
 
 func TestRunOK(t *testing.T) {
@@ -783,7 +819,7 @@ func TestRunWithTimeoutContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	err = pinger.run(ctx, conn)
-	AssertTrue(t, err == nil)
+	AssertTrue(t, errors.Is(err, context.DeadlineExceeded))
 	elapsedTime := time.Since(start)
 	AssertTrue(t, elapsedTime < 10*time.Second)
 
@@ -815,4 +851,30 @@ func TestRunWithBackgroundContext(t *testing.T) {
 		t.FailNow()
 	}
 	AssertTrue(t, stats.PacketsRecv == 10)
+}
+
+func TestSetResolveTimeout(t *testing.T) {
+	p := New("www.google.com")
+	p.Count = 3
+	p.Timeout = 5 * time.Second
+	p.ResolveTimeout = 2 * time.Second
+	err := p.Resolve()
+	AssertNoError(t, err)
+
+	err = p.SetAddr("www.google.com ")
+	AssertError(t, err, "")
+
+	err = p.SetAddr("127.0.0.1 ")
+	AssertError(t, err, "")
+
+	err = p.SetAddr("127.0.0.1")
+	AssertNoError(t, err)
+}
+
+func TestRunStatisticsConcurrent(t *testing.T) {
+	p := New("www.google.com")
+	p.Count = 1
+	p.Interval = time.Millisecond
+	go p.Statistics()
+	p.Run()
 }
